@@ -273,6 +273,33 @@ import XCTest
         XCTAssertEqual(try PublicLinkHTMLMetadata(data: Data(double.utf8), url: url).title, "Real")
     }
 
+    func testMarkersInsideQuotedAttributesOfAnyTagStartNothing() throws {
+        let url = URL(string: "https://public.example.org/page")!
+        func parsed(_ html: String) throws -> PublicLinkHTMLMetadata { try PublicLinkHTMLMetadata(data: Data(html.utf8), url: url) }
+        for marker in ["<textarea>", "<script>", "<style>", "<!--"] {
+            XCTAssertEqual(try parsed("<div data-example=\"\(marker)\"></div><meta property=\"og:title\" content=\"Real\">").title, "Real", marker)
+            XCTAssertEqual(try parsed("<div data-example='\(marker)'></div><meta property=\"og:title\" content=\"Real\">").title, "Real", marker)
+        }
+        // A quote is a value only right after `=`: this apostrophe is text, so the comment after the tag still hides its meta tag.
+        XCTAssertEqual(try parsed("<a title=it's><!-- <meta property='og:title' content='hidden'> --><title>real</title>").title, "real")
+        // Quotes that never close, or that close only after every `>`, leave the scan one pass long.
+        let pages = [String(repeating: "<a x=\"", count: 512 * 1024 / 6), String(repeating: "<a x='>'", count: (512 * 1024 - 1) / 8) + "\"",
+            String(repeating: "<div \"", count: 512 * 1024 / 6)]
+        for page in pages {
+            let start = Date()
+            _ = try parsed(page)
+            XCTAssertLessThan(Date().timeIntervalSince(start), 10, String(page.prefix(12)))
+        }
+    }
+
+    func testQuotedGreaterThanInABlockStartTagDoesNotEndIt() throws {
+        let url = URL(string: "https://public.example.org/page")!
+        let script = "<script data-x=\"> </script>\">const x='<meta property=\"og:title\" content=\"Fake\">';</script><title>Real</title>"
+        XCTAssertEqual(try PublicLinkHTMLMetadata(data: Data(script.utf8), url: url).title, "Real")
+        let textarea = "<textarea data-x=\"> </textarea>\"><meta property=\"og:title\" content=\"Hidden\"></textarea><title>Real</title>"
+        XCTAssertEqual(try PublicLinkHTMLMetadata(data: Data(textarea.utf8), url: url).title, "Real")
+    }
+
     func testPagesOfUnclosedTagsParseInLinearTime() throws {
         let url = URL(string: "https://public.example.org/page")!
         func filled(_ unit: String) -> String { String(repeating: unit, count: 512 * 1024 / unit.utf8.count) }

@@ -452,10 +452,11 @@ struct PublicLinkHTMLMetadata: Equatable, Sendable {
 }
 
 /// The page as Unicode scalars, the unit NSRegularExpression quantifiers count. `removingCommentsAndRawText` drops what a
-/// browser does not read as markup, as `(<meta\b…>)|<!--(?:-?>|.*?(?:--!?>|\z))|<(script|style|textarea)(?=[\t\n\f\r />])[^>]*>(?:.*?</\1[\t\n\f\r ]*>|.*)`
-/// would with the meta tags kept whole; the other scans find the same tags as `<meta\b([^>]{0,8192})>` (with quoted values
-/// read whole), `<title\b[^>]*>(.{0,8192}?)</title\s*>` and `<[^>]*>` with (?is). Each search for a closing marker resumes
-/// from the one found last, so a page of opening tags that are never closed costs one pass, not one pass per tag.
+/// browser does not read as markup: comments, and scripts, styles and textareas whose start tags it reads as
+/// `startTagEnd` does, with the meta tags and every other start tag kept whole. The other scans find the same tags as
+/// `<meta\b([^>]{0,8192})>` (with quoted values read whole), `<title\b[^>]*>(.{0,8192}?)</title\s*>` and `<[^>]*>` with
+/// (?is). Each search for a closing marker resumes from the one found last, so a page of opening tags that are never
+/// closed costs one pass, not one pass per tag.
 private struct HTMLText {
     let scalars: [Unicode.Scalar]
     init(_ text: String) { scalars = Array(text.unicodeScalars) }
@@ -477,38 +478,75 @@ private struct HTMLText {
     private static let rawTextElements: [(tag: [UInt8], name: String)] = [(Self.script, "script"), (Self.style, "style"), (Self.textarea, "textarea")]
 
     /// The page without comments, scripts, styles and textareas. As in a browser, one that is never closed hides the rest of
-    /// the page, and a meta tag is skipped whole, so a marker inside one of its attribute values starts nothing.
+    /// the page, and a start tag is skipped whole, so a marker inside one of its quoted attribute values starts nothing.
     func removingCommentsAndRawText() -> HTMLText {
         var kept: [Unicode.Scalar] = [], copied = 0, index = 0
         var commentClose = Resume(), tagClose = Resume(), rawTextClose = Self.rawTextElements.map { _ in Resume() }
         // Quoted meta scans that fail can overlap, so together they get a fixed number of steps, as in `metaAttributes`.
         var quotedSteps = 4 * 512 * 1024
+        // The states `startTagEnd` read each scalar in, and where each quote last appears on the page.
+        var visited = [UInt8](repeating: 0, count: scalars.count)
+        let lastQuotes = (double: scalars.lastIndex(of: "\"") ?? -1, single: scalars.lastIndex(of: "'") ?? -1)
         kept.reserveCapacity(scalars.count)
-        while let open = first(Self.less, from: index) {
+        scan: while let open = first(Self.less, from: index) {
             var end: Int?
-            if starts(Self.meta, at: open) {
-                if let attributes = metaTag(at: open, tagClose: &tagClose, quotedSteps: &quotedSteps) {
-                    index = attributes.upperBound + 1; continue
-                }
-            } else if starts(Self.comment, at: open) {
+            if starts(Self.meta, at: open), let attributes = metaTag(at: open, tagClose: &tagClose, quotedSteps: &quotedSteps) {
+                index = attributes.upperBound + 1; continue
+            }
+            if starts(Self.comment, at: open) {
                 // `<!-->` and `<!--->` are empty comments; any other one ends at `-->` or `--!>`, or runs to the end of the page.
                 if starts(Self.greater, at: open + 4) { end = open + 5 }
                 else if starts(Self.dashGreater, at: open + 4) { end = open + 6 }
                 else { end = commentClose.next(from: open + 4) { commentEnd(from: $0) }?.upperBound ?? scalars.count }
-            } else {
-                // `<script-widget>` or `<stylex>` is another element: the name must end at whitespace, `/` or `>`.
-                for (offset, element) in Self.rawTextElements.enumerated() where starts(element.tag, at: open) && endsTagName(at: open + element.tag.count) {
-                    // A start tag without `>` hides nothing; an element without its end tag runs to the end of the page.
-                    if let tag = tagClose.next(from: open + element.tag.count, { from in first(Self.greater, from: from).map { $0..<$0 + 1 } }) {
-                        end = rawTextClose[offset].next(from: tag.upperBound) { closing(element.name, from: $0, asciiWhitespace: true) }?.upperBound
-                            ?? scalars.count
-                    }
+            } else if let offset = Self.rawTextElements.firstIndex(where: { starts($0.tag, at: open) && endsTagName(at: open + $0.tag.count) }) {
+                // `<script-widget>` or `<stylex>` is another element: the name must end at whitespace, `/` or `>`. A start tag
+                // without `>` hides nothing; an element without its end tag runs to the end of the page.
+                let element = Self.rawTextElements[offset]
+                if let tag = startTagEnd(from: open + element.tag.count, visited: &visited, lastQuotes: lastQuotes, tagClose: &tagClose) {
+                    end = rawTextClose[offset].next(from: tag + 1) { closing(element.name, from: $0, asciiWhitespace: true) }?.upperBound
+                        ?? scalars.count
                 }
+            } else if open + 1 < scalars.count, Self.isASCIILetter(scalars[open + 1]) {
+                // Any other start tag, including a meta tag its reader does not read, is kept whole. One without `>` leaves the
+                // rest of the page as an attribute, so nothing after it starts a block.
+                var nameEnd = open + 1
+                while nameEnd < scalars.count, !endsTagName(at: nameEnd) { nameEnd += 1 }
+                guard let tag = startTagEnd(from: nameEnd, visited: &visited, lastQuotes: lastQuotes, tagClose: &tagClose) else { break scan }
+                index = tag + 1; continue
             }
             if let end { kept += scalars[copied..<open]; copied = end; index = end } else { index = open + 1 }
         }
         kept += scalars[copied...]
         return HTMLText(scalars: kept)
+    }
+
+    /// The `>` that ends a start tag whose attributes begin at `index`, or nil when none does. A quote after `=` and any
+    /// ASCII whitespace opens a value that runs to the same quote, so a `>` or marker inside it belongs to the value; such a
+    /// quote that appears nowhere later is text, and the tag ends at its next `>`. A scan that reaches a scalar in a state a
+    /// scan already read it in repeats one that found no `>` (any scan that found one was passed), so it stops there:
+    /// `visited` keeps the scans of a page together to one pass per state.
+    private func startTagEnd(from index: Int, visited: inout [UInt8], lastQuotes: (double: Int, single: Int), tagClose: inout Resume) -> Int? {
+        // 0: between attributes, 1: after `=`, 2: inside "…", 3: inside '…'.
+        var index = index, state = 0
+        while index < scalars.count {
+            let bit = UInt8(1 << state)
+            if visited[index] & bit != 0 { return nil }
+            visited[index] |= bit
+            let scalar = scalars[index]
+            if state >= 2 {
+                let quote: Unicode.Scalar = state == 2 ? "\"" : "'"
+                if scalar == quote { state = 0 }
+            } else if scalar == ">" { return index }
+            else if scalar == "=" { state = 1 }
+            else if state == 1, scalar == "\"" || scalar == "'" {
+                if index >= (scalar == "\"" ? lastQuotes.double : lastQuotes.single) {
+                    return tagClose.next(from: index + 1, { from in first(Self.greater, from: from).map { $0..<$0 + 1 } })?.lowerBound
+                }
+                state = scalar == "\"" ? 2 : 3
+            } else if !Self.isASCIIWhitespace(scalar) { state = 0 }
+            index += 1
+        }
+        return nil
     }
 
     /// The range of the first `-->` or `--!>` at or after `index`.
@@ -633,4 +671,5 @@ private struct HTMLText {
         default: return false
         }
     }
+    private static func isASCIILetter(_ scalar: Unicode.Scalar) -> Bool { (65...90).contains(scalar.value) || (97...122).contains(scalar.value) }
 }
