@@ -116,15 +116,17 @@ private enum LibrarySQL {
         }
         if let days = query.days { whereParts.append("i.created>=?"); values.append(.real(now.addingTimeInterval(-Double(days) * 86400).timeIntervalSince1970)) }
         if !query.domain.isEmpty {
-            var domain = query.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            var domain = query.domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
             // Stored hosts are ASCII (punycode), so an internationalized name typed as written is converted first; anything with a path, query, port or credentials is not a host name and stays as typed.
             if domain.unicodeScalars.contains(where: { !$0.isASCII }), domain.rangeOfCharacter(from: CharacterSet(charactersIn: "/?#@:\\").union(.whitespaces)) == nil, let host = URL(string: "https://" + domain)?.host { domain = host }
             if domain.hasPrefix("www.") { domain.removeFirst(4) }
-            let suffix = "." + domain
-            // Literal host boundaries include subdomains without wildcard or
-            // suffix collisions (youtube.com must not match notyoutube.com).
-            whereParts.append("(i.domain=? OR substr(i.domain,-length(?))=?)")
-            values += [.text(domain), .text(suffix), .text(suffix)]
+            if !domain.isEmpty {
+                let suffix = "." + domain
+                // Literal host boundaries include subdomains without wildcard or
+                // suffix collisions (youtube.com must not match notyoutube.com).
+                whereParts.append("(i.domain=? OR substr(i.domain,-length(?))=?)")
+                values += [.text(domain), .text(suffix), .text(suffix)]
+            }
         }
         // Bound literal substring search handles Turkish, short strings, CJK
         // and punctuation. The FTS index also supports future ranked searches.
@@ -841,13 +843,16 @@ extension String {
         if record.kind == .link, let normalized = record.normalizedURL {
             return try !db.rows("SELECT 1 FROM items WHERE normalized=? AND kind='link' AND deleted IS NULL AND shelf=1 AND id<>?", [.text(normalized)] + id).isEmpty
         }
-        guard record.kind == .text, let text = record.text else { return false }
+        guard record.createdAsNote != true, record.kind == .text, let text = record.text else { return false }
         let key = TextIdentity.key(text)
         // A rollback app can edit text while this app stays open; repair the index after another connection writes, as captureText does.
         let observed = try db.rows("PRAGMA data_version").first?["data_version"]?.number
         if observed != textIdentityDataVersion { try db.transaction { try repairTextIdentity() }; textIdentityDataVersion = observed }
         for row in try db.rows("SELECT i.id FROM text_identity t JOIN items i ON i.id=t.item WHERE t.digest=? AND i.kind='text' AND i.deleted IS NULL AND i.shelf=1 AND i.id<>?", [.blob(Self.textDigest(text))] + id) {
-            if let other = row["id"]?.string.flatMap(UUID.init(uuidString:)), let candidate = try item(other)?.text, TextIdentity.key(candidate).utf8.elementsEqual(key.utf8) { return true }
+            if let other = row["id"]?.string.flatMap(UUID.init(uuidString:)),
+               let candidate = try item(other), candidate.createdAsNote != true,
+               let candidateText = candidate.text,
+               TextIdentity.key(candidateText).utf8.elementsEqual(key.utf8) { return true }
         }
         return false
     }
@@ -1067,7 +1072,7 @@ extension String {
     }
     private func cleanedName(_ name: String) throws -> String { let value = name.trimmingCharacters(in: .whitespacesAndNewlines); guard !value.isEmpty, value.count <= 64, value.rangeOfCharacter(from: .controlCharacters) == nil else { throw HistoryFiles.Failure.invalidDestination }; return value }
     func addTag(_ name: String, to ids: [UUID]) throws {
-        let name = try cleanedName(name.trimmingCharacters(in: CharacterSet(charactersIn: "#"))), folded = name.libraryFolded
+        let name = try cleanedName(name.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "#"))), folded = name.libraryFolded
         let existing = try tags().first { $0.name.libraryFolded == folded }, tagID = existing?.id ?? UUID()
         var values = try ids.map { id -> LibraryRecord in guard let value = try item(id) else { throw HistoryFiles.Failure.unsafeFile }; return value }
         for index in values.indices { values[index].retainedAt = values[index].retainedAt ?? now(); try ensureOwned(&values[index]) }

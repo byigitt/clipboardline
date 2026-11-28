@@ -195,6 +195,12 @@ import XCTest
         XCTAssertEqual(Set(try library.query(LibraryQuery(scope: .recent, domain: "YouTube.com")).map(\.id)), Set(expected))
         XCTAssertEqual(try library.query(LibraryQuery(scope: .recent, domain: "WWW.YouTube.com.")).count, 3)
         XCTAssertTrue(try library.query(LibraryQuery(scope: .recent, domain: "%youtube.com")).isEmpty)
+        let note = try XCTUnwrap(library.captureText("Plain note"))
+        let allIDs = Set(try library.query(LibraryQuery(scope: .recent)).map(\.id))
+        XCTAssertTrue(allIDs.contains(note.id))
+        for dotOnly in [".", "...", " . "] {
+            XCTAssertEqual(Set(try library.query(LibraryQuery(scope: .recent, domain: dotOnly)).map(\.id)), allIDs, dotOnly)
+        }
     }
     func testBlankOrPaddedItemNameIsIgnoredOrTrimmedLikeWindows() throws {
         let f = try SyntheticFixture(); defer { f.cleanup() }; let library = try store(f)
@@ -213,6 +219,8 @@ import XCTest
         let tag = try XCTUnwrap(library.tags().first); try library.renameTag(tag.id, name: "#urgent")
         XCTAssertEqual(try library.tags().map(\.name), ["urgent"])
         try library.addTag("#urgent", to: [second.id])
+        try library.addTag(" #urgent ", to: [second.id])
+        XCTAssertThrowsError(try library.addTag(" ## ", to: [second.id]))
         XCTAssertEqual(try library.tags().map(\.name), ["urgent"])
         XCTAssertThrowsError(try library.renameTag(tag.id, name: "##"))
         let revision = library.revision
@@ -337,6 +345,19 @@ import XCTest
         let other = try library.captureLink(URL(string: "https://example.com/a?page=1")!); try library.removeFromShelf([other.id])
         f.date.addTimeInterval(10); _ = try library.captureLink(URL(string: "https://example.com/a?page=2")!)
         XCTAssertEqual(try library.undoShelfRemoval(), [other.id])
+    }
+    func testUndoTakeDownDoesNotLetALibraryNoteBlockAClipboardCopy() throws {
+        let f = try SyntheticFixture(); defer { f.cleanup() }; let library = try store(f)
+        let note = try library.createNote(); try library.update(note.id) { $0.text = "Meeting agenda" }
+        let copy = try XCTUnwrap(library.captureText("Meeting agenda"))
+        XCTAssertNotEqual(copy.id, note.id)
+        try library.removeFromShelf([copy.id])
+        XCTAssertEqual(try library.undoShelfRemoval(), [copy.id])
+        XCTAssertEqual(Set(try library.shelfItems(.text).map(\.id)), [note.id, copy.id])
+        // Taking down the Library note while the clipboard copy is on the shelf also remains undoable.
+        try library.removeFromShelf([note.id])
+        XCTAssertEqual(try library.undoShelfRemoval(), [note.id])
+        XCTAssertEqual(Set(try library.shelfItems(.text).map(\.id)), [note.id, copy.id])
     }
     func testUndoTakeDownSeesATextEditedByAnOlderAppWhileOpen() throws {
         let f = try SyntheticFixture(); defer { f.cleanup() }; let library = try store(f)
