@@ -66,7 +66,9 @@ declared character set (byte-order mark, `Content-Type`, XHTML declaration, earl
 Turkish letters.
 `link-preview-unclosed-blocks` requires a link preview to ignore comments and script, style and
 textarea elements the way a browser parses them: an unclosed one hides the rest of the page, while a
-custom element such as `<script-widget>` or a marker inside a meta attribute value starts nothing.
+custom element such as `<script-widget>`, a marker inside a meta attribute value or a marker inside
+any tag's quoted attribute value starts nothing, and a quoted `>` inside a script, style or textarea
+start tag does not end it.
 `image-recopy-dedupe` requires copying the same image again to keep one Library item,
 moved to the front with its pin, name, tags and folders.
 `note-survives-matching-copy` requires a note made with New note to stay as it is when

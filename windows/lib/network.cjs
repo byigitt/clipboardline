@@ -155,11 +155,37 @@ function meta(html, name) {
 // Comments and script, style and textarea elements never supply the title or image. As in a browser, an unclosed one
 // hides the rest of the page; a script, style or textarea start tag that never gets its '>' starts nothing. A name
 // counts only before ASCII whitespace, '/' or '>', so <script-widget> is an ordinary element. A meta tag is kept whole,
-// ending where meta() ends it, so a marker inside one of its quoted values starts nothing. Every search resumes from
-// the last one, so the pass stays linear.
+// ending where meta() ends it, so a marker inside one of its quoted values starts nothing. Every other start tag is
+// read whole too (see startTagEnd), so a marker inside any quoted attribute value starts nothing and a quoted '>'
+// does not end a block's start tag. Every search resumes from the last one, so the pass stays linear.
 function withoutNonMetadata(html) {
-  const opener = new RegExp(`(${metaTag})|<(?:(!--)|(script|style|textarea)(?=[\\t\\n\\f\\r />]))`, 'gi');
+  const opener = new RegExp(`(${metaTag})|<(?:(!--)|(script|style|textarea)(?=[\\t\\n\\f\\r />])|[a-z][^\\t\\n\\f\\r />]*)`, 'gi');
   const metaEnd = tagEnds(html, metaLimit, true), found = new Map();
+  const lastQuote = {'"': html.lastIndexOf('"'), "'": html.lastIndexOf("'")};
+  // Scan states: 0 outside a value, 1 after '=', 2 inside "…", 3 inside '…', 4 after a quote that never closes, which
+  // is text, so the tag ends at the next '>'. `failed` marks, per index, the states a scan that never found its '>'
+  // passed through; the scan is deterministic, so a later scan reaching one fails too.
+  const failed = new Uint8Array(html.length);
+  const advance = (index, state) => {
+    const char = html[index];
+    if (state === 2 || state === 3) return char === (state === 2 ? '"' : "'") ? 0 : state;
+    if (char === '>') return -1;
+    if (state === 4) return 4;
+    if (char === '=') return 1;
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\f' || char === '\r') return state;
+    // A quote opens a value only after '='; one with no identical quote later in the page is text.
+    if (state === 1 && (char === '"' || char === "'")) return lastQuote[char] > index ? (char === '"' ? 2 : 3) : 4;
+    return 0;
+  };
+  // Where the start tag whose attributes begin at `start` ends: the first '>' outside a quoted value, or -1.
+  const startTagEnd = start => {
+    let index = start, state = 0;
+    for (; index < html.length && !(failed[index] & (1 << state)); index++) {
+      const nextState = advance(index, state); if (nextState < 0) return index; state = nextState;
+    }
+    for (let at = start, mark = 0; at < index; at++) { failed[at] |= 1 << mark; mark = advance(at, mark); }
+    return -1;
+  };
   // The first match of `source` at or after `from`; the last match is reused while it is still ahead.
   const next = (source, from) => {
     let last = found.get(source);
@@ -172,14 +198,24 @@ function withoutNonMetadata(html) {
   let kept = '', from = 0;
   for (let match; (match = opener.exec(html));) {
     const body = opener.lastIndex; let stop;
-    if (match[1]) { const end = metaEnd(body); if (end >= 0) opener.lastIndex = end + 1; continue; }
+    if (match[1]) {
+      let end = metaEnd(body);
+      // A meta tag meta() does not read is an ordinary start tag.
+      if (end < 0) { let name = body; while (name < html.length && !/[\t\n\f\r />]/.test(html[name])) name++; end = startTagEnd(name); }
+      if (end < 0) break;
+      opener.lastIndex = end + 1; continue;
+    }
     if (match[2]) {
       // <!--> and <!---> are empty comments; any other comment ends at the first --> or --!>.
       if (html[body] === '>') stop = body + 1; else if (html.startsWith('->', body)) stop = body + 2;
       else stop = next('--!?>', body).end ?? html.length;
+    } else if (match[3]) {
+      const end = startTagEnd(body); if (end < 0) continue;
+      stop = next(`</${match[3].toLowerCase()}[\\t\\n\\f\\r ]*>`, end + 1).end ?? html.length;
     } else {
-      const tag = next('>', body); if (tag.index < 0) continue;
-      stop = next(`</${match[3].toLowerCase()}[\\t\\n\\f\\r ]*>`, tag.end).end ?? html.length;
+      // Any other start tag is skipped whole; one that never ends lets nothing after it start a block.
+      const end = startTagEnd(body); if (end < 0) break;
+      opener.lastIndex = end + 1; continue;
     }
     kept += html.slice(from, match.index); from = opener.lastIndex = stop;
   }

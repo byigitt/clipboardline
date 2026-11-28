@@ -76,6 +76,25 @@ test('a marker inside a meta attribute value starts nothing',async()=>{
  }
 });
 
+test('a marker inside any tag\'s quoted attribute starts nothing',async()=>{
+ const page=html=>linkMetadata('https://example.com/a',async()=>({bytes:Buffer.from(html),url:'https://example.com/a',type:'text/html'}));
+ for(const marker of ['<textarea>','<script>','<style>','<!--'])for(const quote of ['"',"'"]){
+  assert.deepEqual(await page(`<div data-example=${quote}${marker}${quote}></div><meta property="og:title" content="Real">`),{title:'Real',thumbnail:''},quote+marker);
+ }
+ assert.deepEqual(await page(`<a title=it's><!-- <meta property='og:title' content='hidden'> --><title>real</title>`),{title:'real',thumbnail:''});
+ const size=512*1024;
+ for(const html of ['<a x="'.repeat(size/6|0),`<a x='>'`.repeat((size-1)/9|0)+'"','<div "'.repeat(size/6|0)]){
+  const started=Date.now();assert.equal((await linkMetadata('https://example.com/',async()=>({bytes:Buffer.from(html),url:'https://example.com/',type:'text/html'}))).title,'example.com');
+  assert.ok(Date.now()-started<2000,`parse took ${Date.now()-started} ms`);
+ }
+});
+
+test('a quoted > inside a block start tag does not end it',async()=>{
+ const page=html=>linkMetadata('https://example.com/a',async()=>({bytes:Buffer.from(html),url:'https://example.com/a',type:'text/html'}));
+ assert.deepEqual(await page(`<script data-x="> </script>">const x='<meta property="og:title" content="Fake">';</script><title>Real</title>`),{title:'Real',thumbnail:''});
+ assert.deepEqual(await page(`<textarea data-x="> </textarea>"><meta property="og:title" content="Hidden"></textarea><title>Real</title>`),{title:'Real',thumbnail:''});
+});
+
 test('repeated block openers at the 512 KiB fetch ceiling parse in linear time',async()=>{
  const page=html=>async()=>({bytes:Buffer.from(html),url:'https://example.com/',type:'text/html'}),size=512*1024;
  for(const piece of ['<script>','<style>','<!--','<textarea>','<meta "','<script-x>']){
