@@ -8,6 +8,63 @@ import XCTest
     private func store(_ f: SyntheticFixture) throws -> LibraryStore {
         try LibraryStore(defaults: f.defaults, inbox: f.inbox, now: { f.date }, moveToTrash: fixtureTrash(f.folder))
     }
+    func testPruneDropsAnUnsavedScreenshotWhoseFileWasDeleted() throws {
+        let f = try SyntheticFixture(); defer { f.cleanup() }
+        let library = try store(f)
+        let deletedFile = try f.image(owned: false), keptFile = try f.image(owned: false)
+        let deleted = try library.captureImage(deletedFile)
+        f.date.addTimeInterval(1)
+        let kept = try library.captureImage(keptFile)
+        try FileManager.default.removeItem(at: deletedFile)
+        try library.prune()
+        XCTAssertNotNil(try library.item(deleted.id)?.deletedAt)
+        XCTAssertFalse(try library.item(deleted.id)?.onShelf == true)
+        XCTAssertNil(try library.item(kept.id)?.deletedAt)
+        XCTAssertTrue(try library.item(kept.id)?.onShelf == true)
+    }
+    func testPruneKeepsASavedScreenshotWhoseFileWasDeleted() throws {
+        let f = try SyntheticFixture(); defer { f.cleanup() }
+        let library = try store(f)
+        let record = try library.captureImage(try f.image(owned: false))
+        try library.retain([record.id])
+        let saved = try XCTUnwrap(try library.item(record.id))
+        let savedPath = try XCTUnwrap(saved.path)
+        try FileManager.default.removeItem(atPath: savedPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: savedPath))
+        try library.prune()
+        XCTAssertNil(try library.item(record.id)?.deletedAt)
+        XCTAssertTrue(try library.item(record.id)?.onShelf == true)
+    }
+    /// A screenshot on a disk that is not mounted has no folder either; it must stay until the disk is back.
+    func testPruneKeepsAnUnsavedScreenshotWhoseFolderIsGone() throws {
+        let f = try SyntheticFixture(); defer { f.cleanup() }
+        let library = try store(f)
+        let volume = f.folder.appendingPathComponent("Volume/Shots")
+        try FileManager.default.createDirectory(at: volume, withIntermediateDirectories: true)
+        let file = volume.appendingPathComponent("Screenshot.png")
+        try FileManager.default.moveItem(at: try f.image(owned: false), to: file)
+        let record = try library.captureImage(file)
+        try FileManager.default.removeItem(at: volume.deletingLastPathComponent())
+        try library.prune()
+        XCTAssertNil(try library.item(record.id)?.deletedAt)
+        XCTAssertTrue(try library.item(record.id)?.onShelf == true)
+    }
+    func testPruneKeepsAnUnsavedScreenshotWhoseFolderCannotBeRead() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores folder permissions")
+        let f = try SyntheticFixture(); defer { f.cleanup() }
+        let library = try store(f)
+        let locked = f.folder.appendingPathComponent("Locked")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        let file = locked.appendingPathComponent("Screenshot.png")
+        try FileManager.default.moveItem(at: try f.image(owned: false), to: file)
+        let record = try library.captureImage(file)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path) }
+        try library.prune()
+        XCTAssertNil(try library.item(record.id)?.deletedAt)
+        XCTAssertTrue(try library.item(record.id)?.onShelf == true)
+    }
     func testMigrationPreservesTextBytesDatesFavoritesIDsAndOriginals() throws {
         let f = try SyntheticFixture(); defer { f.cleanup() }
         let image = try f.image(owned: false), bytes = try Data(contentsOf: image)
@@ -138,6 +195,12 @@ import XCTest
         XCTAssertEqual(Set(try library.query(LibraryQuery(scope: .recent, domain: "YouTube.com")).map(\.id)), Set(expected))
         XCTAssertEqual(try library.query(LibraryQuery(scope: .recent, domain: "WWW.YouTube.com.")).count, 3)
         XCTAssertTrue(try library.query(LibraryQuery(scope: .recent, domain: "%youtube.com")).isEmpty)
+        let note = try XCTUnwrap(library.captureText("Plain note"))
+        let allIDs = Set(try library.query(LibraryQuery(scope: .recent)).map(\.id))
+        XCTAssertTrue(allIDs.contains(note.id))
+        for dotOnly in [".", "...", " . "] {
+            XCTAssertEqual(Set(try library.query(LibraryQuery(scope: .recent, domain: dotOnly)).map(\.id)), allIDs, dotOnly)
+        }
     }
     func testBlankOrPaddedItemNameIsIgnoredOrTrimmedLikeWindows() throws {
         let f = try SyntheticFixture(); defer { f.cleanup() }; let library = try store(f)
@@ -156,6 +219,8 @@ import XCTest
         let tag = try XCTUnwrap(library.tags().first); try library.renameTag(tag.id, name: "#urgent")
         XCTAssertEqual(try library.tags().map(\.name), ["urgent"])
         try library.addTag("#urgent", to: [second.id])
+        try library.addTag(" #urgent ", to: [second.id])
+        XCTAssertThrowsError(try library.addTag(" ## ", to: [second.id]))
         XCTAssertEqual(try library.tags().map(\.name), ["urgent"])
         XCTAssertThrowsError(try library.renameTag(tag.id, name: "##"))
         let revision = library.revision
@@ -280,6 +345,19 @@ import XCTest
         let other = try library.captureLink(URL(string: "https://example.com/a?page=1")!); try library.removeFromShelf([other.id])
         f.date.addTimeInterval(10); _ = try library.captureLink(URL(string: "https://example.com/a?page=2")!)
         XCTAssertEqual(try library.undoShelfRemoval(), [other.id])
+    }
+    func testUndoTakeDownDoesNotLetALibraryNoteBlockAClipboardCopy() throws {
+        let f = try SyntheticFixture(); defer { f.cleanup() }; let library = try store(f)
+        let note = try library.createNote(); try library.update(note.id) { $0.text = "Meeting agenda" }
+        let copy = try XCTUnwrap(library.captureText("Meeting agenda"))
+        XCTAssertNotEqual(copy.id, note.id)
+        try library.removeFromShelf([copy.id])
+        XCTAssertEqual(try library.undoShelfRemoval(), [copy.id])
+        XCTAssertEqual(Set(try library.shelfItems(.text).map(\.id)), [note.id, copy.id])
+        // Taking down the Library note while the clipboard copy is on the shelf also remains undoable.
+        try library.removeFromShelf([note.id])
+        XCTAssertEqual(try library.undoShelfRemoval(), [note.id])
+        XCTAssertEqual(Set(try library.shelfItems(.text).map(\.id)), [note.id, copy.id])
     }
     func testUndoTakeDownSeesATextEditedByAnOlderAppWhileOpen() throws {
         let f = try SyntheticFixture(); defer { f.cleanup() }; let library = try store(f)
